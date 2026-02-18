@@ -1,0 +1,26 @@
+# Environment Variables (Secrets)
+.env
+
+# Virtual Environment
+venv/
+env/
+
+# Python Compiled Files
+__pycache__/
+*.py[cod]
+
+# Database & Scraped Data (Generated Content)
+# chroma_db/  <-- Commented out for Demo Deployment
+# *.jsonl     <-- Commented out for Demo Deployment
+scraped_data_*.json
+
+# IDE Settings
+.idea/
+.vscode/
+
+# System Files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
