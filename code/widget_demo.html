@@ -1,0 +1,66 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Church Chatbot</title>
+    <!-- Web Component Script -->
+    <script src="church_chatbot.js?v=v3" defer></script>
+    <style>
+        body {
+            font-family: 'Inter', sans-serif;
+            background-color: #f3f4f6;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+            margin: 0;
+            color: #333;
+        }
+
+        .container {
+            text-align: center;
+            max-width: 600px;
+            padding: 20px;
+        }
+
+        h1 {
+            font-weight: 800;
+            color: #111827;
+        }
+
+        p {
+            color: #6b7280;
+            line-height: 1.6;
+        }
+
+        code {
+            background: #e5e7eb;
+            padding: 2px 6px;
+            border-radius: 4px;
+            font-size: 0.9em;
+        }
+    </style>
+</head>
+
+<body>
+
+    <div class="container">
+        <h1>Church Website Demo</h1>
+        <p>This page simulates a church website where the chatbot is installed.</p>
+        <p>The chatbot below is a self-contained <code>&lt;church-chatbot&gt;</code> Web Component.</p>
+    </div>
+
+    <!-- 
+        ATTRIBUTES:
+        api-url: The backend endpoint
+        title: Header text (default "Church Assistant")
+        greeting: First message
+        church-id: (Optional) for multi-tenant
+    -->
+    <church-chatbot api-url="/chat" title="Church Assistant"></church-chatbot>
+
+</body>
+
+</html>
