@@ -9,7 +9,7 @@ There are **two Lambda functions** and **two Docker images**:
 | Chat | `church-bot-heritage` | `:chat` (also `:latest`) | `server.handler` | Answers questions (slim, no browser) |
 | Updater | `church-bot-updater` | `:updater` | `updater.handler` | Weekly scrape → S3 zip |
 
-Data lives in S3: `s3://mi-heritage-church-data/{church_id}.zip`
+Data lives in S3: `s3://YOUR_BUCKET/{church_id}.zip`
 
 ---
 
@@ -176,7 +176,7 @@ Or invoke updater with payload `{"task":"weekly_update","church_id":"grace"}`.
 | Variable | Required | Meaning |
 |---|---|---|
 | `OPENAI_API_KEY` | yes | OpenAI access |
-| `S3_BUCKET_NAME` | yes | e.g. `mi-heritage-church-data` |
+| `S3_BUCKET_NAME` | yes | Your church data bucket |
 | `CHURCH_ID` | no | Default if widget omits id (`heritage`) |
 | `API_KEYS` | no | Comma-separated keys; if set, require `X-API-Key` |
 | `ALLOWED_ORIGINS` | no | Override CORS allowlist |

@@ -6,7 +6,15 @@ cd /d "%~dp0.."
 :: Does NOT scrape church websites. Data updates: weekly_update.bat / updater Lambda.
 
 if "%AWS_REGION%"=="" set AWS_REGION=us-east-1
-if "%AWS_ACCOUNT_ID%"=="" set AWS_ACCOUNT_ID=762297409734
+if exist ".env" (
+  for /f "usebackq tokens=1,* delims==" %%a in (`findstr /b "AWS_ACCOUNT_ID=" .env`) do (
+    if "%%a"=="AWS_ACCOUNT_ID" if "%AWS_ACCOUNT_ID%"=="" set "AWS_ACCOUNT_ID=%%b"
+  )
+)
+if "%AWS_ACCOUNT_ID%"=="" (
+  echo [ERROR] Set AWS_ACCOUNT_ID in .env or the environment. Do not commit that file.
+  exit /b 1
+)
 if "%ECR_REPO%"=="" set ECR_REPO=church-chatbot-heritage
 if "%CHAT_FUNCTION_NAME%"=="" set CHAT_FUNCTION_NAME=church-bot-heritage
 if "%UPDATER_FUNCTION_NAME%"=="" set UPDATER_FUNCTION_NAME=church-bot-updater

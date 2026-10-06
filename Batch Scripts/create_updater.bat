@@ -4,11 +4,23 @@ cd /d "%~dp0.."
 
 :: One-time: create the updater Lambda from the :updater ECR image.
 if "%AWS_REGION%"=="" set AWS_REGION=us-east-1
-if "%AWS_ACCOUNT_ID%"=="" set AWS_ACCOUNT_ID=762297409734
+if exist ".env" (
+  for /f "usebackq tokens=1,* delims==" %%a in (`findstr /b "AWS_ACCOUNT_ID= S3_BUCKET_NAME=" .env`) do (
+    if "%%a"=="AWS_ACCOUNT_ID" if "%AWS_ACCOUNT_ID%"=="" set "AWS_ACCOUNT_ID=%%b"
+    if "%%a"=="S3_BUCKET_NAME" if "%S3_BUCKET_NAME%"=="" set "S3_BUCKET_NAME=%%b"
+  )
+)
+if "%AWS_ACCOUNT_ID%"=="" (
+  echo [ERROR] Set AWS_ACCOUNT_ID in .env or the environment. Do not commit that file.
+  exit /b 1
+)
+if "%S3_BUCKET_NAME%"=="" (
+  echo [ERROR] Set S3_BUCKET_NAME in .env or the environment. Do not commit that file.
+  exit /b 1
+)
 if "%ECR_REPO%"=="" set ECR_REPO=church-chatbot-heritage
 if "%CHAT_FUNCTION_NAME%"=="" set CHAT_FUNCTION_NAME=church-bot-heritage
 if "%UPDATER_FUNCTION_NAME%"=="" set UPDATER_FUNCTION_NAME=church-bot-updater
-if "%S3_BUCKET_NAME%"=="" set S3_BUCKET_NAME=mi-heritage-church-data
 
 set UPDATER_IMAGE=%AWS_ACCOUNT_ID%.dkr.ecr.%AWS_REGION%.amazonaws.com/%ECR_REPO%:updater
 

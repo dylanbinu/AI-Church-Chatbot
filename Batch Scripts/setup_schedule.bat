@@ -4,7 +4,15 @@ cd /d "%~dp0.."
 
 :: Creates/updates an EventBridge Scheduler rule that invokes the updater Lambda weekly.
 if "%AWS_REGION%"=="" set AWS_REGION=us-east-1
-if "%AWS_ACCOUNT_ID%"=="" set AWS_ACCOUNT_ID=762297409734
+if exist ".env" (
+  for /f "usebackq tokens=1,* delims==" %%a in (`findstr /b "AWS_ACCOUNT_ID=" .env`) do (
+    if "%%a"=="AWS_ACCOUNT_ID" if "%AWS_ACCOUNT_ID%"=="" set "AWS_ACCOUNT_ID=%%b"
+  )
+)
+if "%AWS_ACCOUNT_ID%"=="" (
+  echo [ERROR] Set AWS_ACCOUNT_ID in .env or the environment. Do not commit that file.
+  exit /b 1
+)
 if "%UPDATER_FUNCTION_NAME%"=="" set UPDATER_FUNCTION_NAME=church-bot-updater
 if "%CHURCH_ID%"=="" set CHURCH_ID=heritage
 if "%SCHEDULE_NAME%"=="" set SCHEDULE_NAME=church-bot-weekly-%CHURCH_ID%
