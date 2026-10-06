@@ -1,313 +1,402 @@
-# --- PYSQLITE3 FIX FOR LAMBDA (Must be first) ---
-try:
-    __import__('pysqlite3')
-    import sys
-    sys.modules['sqlite3'] = sys.modules.pop('pysqlite3')
-except ImportError:
-    pass 
+"""
+Multi-tenant Church Chatbot API.
 
-import sys
-import shutil
-import traceback
-import os
-import json
+One application serves every registered church. Per-request `church_id`
+selects the scraped knowledge bundle (local `.runtime/` or S3 zip).
+"""
+from __future__ import annotations
+
 import re
+import threading
+import time
+import traceback
+from typing import List, Optional, Tuple
 
-from fastapi import FastAPI, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
-from pydantic import BaseModel
-from typing import List, Optional
-
-# --- SAFETY BOOT HARNESS ---
-GLOBAL_BOOT_ERROR = None
-app = None
-handler = None
-
+# pysqlite3 shim for Lambda Chromadb
 try:
-    # --- LAMBDA FIXES ---
-    # 1. FIX READ-ONLY FILESYSTEM
-    # Lambda effectively runs in read-only /var/task. SQLite needs to write wal/lock files.
-    # We must copy the DB to /tmp (the only writable dir) on startup.
-    if os.environ.get("AWS_LAMBDA_FUNCTION_NAME"):
-        print("[INFO] Detected AWS Lambda Environment. Setting up /tmp...")
-        writable_db_path = "/tmp/chroma_db"
-        
-        # Override config paths BEFORE import/usage
-        # We need to manually fix config module attributes if they are already imported?
-        # Typically config is imported below.
-        
-        # Check source path
-        source_db_path = os.path.join(os.getcwd(), "chroma_db") 
-        # (Assuming cwd is /var/task/code or /var/task depending on WORKDIR)
-        
-        if os.path.exists(source_db_path):
-            if os.path.exists(writable_db_path):
-                shutil.rmtree(writable_db_path)
-            shutil.copytree(source_db_path, writable_db_path)
-            print(f"[INFO] Copied ChromaDB from {source_db_path} to {writable_db_path}")
-        else:
-             # Fallback check for /var/task root
-             root_source = "/var/task/chroma_db"
-             if os.path.exists(root_source):
-                 if os.path.exists(writable_db_path):
-                    shutil.rmtree(writable_db_path)
-                 shutil.copytree(root_source, writable_db_path)
-                 print(f"[INFO] Copied ChromaDB from {root_source} to {writable_db_path}")
+    __import__("pysqlite3")
+    import sys as _sys
 
-        # 3. FIX TIKTOKEN CACHE (Must be writable)
-        os.environ["TIKTOKEN_CACHE_DIR"] = "/tmp"
+    _sys.modules["sqlite3"] = _sys.modules.pop("pysqlite3")
+except ImportError:
+    pass
 
-    # --- LOAD DEPENDENCIES ---
-    # (Delay imports to catch ImportError)
-    from langchain_chroma import Chroma
-    from langchain_openai import ChatOpenAI, OpenAIEmbeddings
-    from langchain_core.prompts import ChatPromptTemplate
-    from langchain_core.messages import HumanMessage, AIMessage
-    
-    # Local Modules
-    import config
-    # Force override config path after import
-    if os.environ.get("AWS_LAMBDA_FUNCTION_NAME"):
-        config.CHROMA_PATH = "/tmp/chroma_db"
+from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi.exceptions import RequestValidationError
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+from langchain_core.messages import AIMessage, HumanMessage
+from langchain_core.prompts import ChatPromptTemplate
+from pydantic import BaseModel, Field
 
-    from retrieval import retrieve_and_rank
-    from context_manager import load_context_from_file
-    from link_utils import validate_and_fix_links
+import config
+from app_state import get_state, reload_state
+from auth import require_api_key
+from data_sync import head_remote_manifest
+from link_utils import validate_and_fix_links
+from logging_config import setup_logging
+from registry import UnknownChurchError, all_allowed_origins, get_church, list_church_ids
+from retrieval import CONTEXT_CHAR_LIMIT, build_search_query, retrieve_and_rank
 
-    # --- LOAD CHURCH REGISTRY & CONTEXT ---
-    CHURCHES = {}
-    CHURCH_CONTEXTS = {} 
+logger = setup_logging()
 
-    if os.path.exists(config.CHURCHES_FILE):
-        with open(config.CHURCHES_FILE, "r") as f:
-            CHURCHES = json.load(f)
-        print(f"Loaded {len(CHURCHES)} churches from registry.")
+CACHE_TTL_SECONDS = 600
+CACHE_MAX = 128
+_cache_lock = threading.Lock()
+_answer_cache: dict[Tuple[str, str, str, str], Tuple[float, "ChatResponse"]] = {}
 
-    # Load Default (Legacy) Context
-    DEFAULT_CONTEXT = load_context_from_file(config.DEFAULT_DATA_FILE)
-    if not DEFAULT_CONTEXT:
-        DEFAULT_CONTEXT = {"valid_urls": set(), "main_domain": "https://google.com", "preferred_keyword": None}
 
-    # Load Specific Church Contexts
-    for church_id in CHURCHES:
-        path = os.path.join(config.PROJECT_ROOT, f"scraped_data_{church_id}.jsonl")
-        ctx = load_context_from_file(path)
-        if ctx:
-            CHURCH_CONTEXTS[church_id] = ctx
-            print(f"Loaded context for {church_id}")
+def normalize_question(text: str) -> str:
+    return " ".join(text.lower().split()).strip(" ?.!")
 
-    # --- GLOBAL MODEL INITIALIZATION (Optimization) ---
-    print("--- Initializing AI Models & Database Connection... ---")
-    embedding_model = OpenAIEmbeddings(model=config.EMBEDDING_MODEL_NAME)
-    llm = ChatOpenAI(model_name=config.LLM_MODEL_NAME, temperature=config.LLM_TEMPERATURE)
 
-    # Initialize ChromaDB Client Globally if DB exists
-    vector_db = None
-    if os.path.exists(config.CHROMA_PATH):
-        vector_db = Chroma(persist_directory=config.CHROMA_PATH, embedding_function=embedding_model)
-        print("--- Vector Database Connected ---")
-    else:
-        print("--- WARNING: Vector Database not found. Run ingest.py first. ---")
-        
-    # --- GLOBAL MODEL INITIALIZATION (Optimization) ---
-    print("--- Initializing AI Models & Database Connection... ---")
-    embedding_model = OpenAIEmbeddings(model=config.EMBEDDING_MODEL_NAME)
-    llm = ChatOpenAI(model_name=config.LLM_MODEL_NAME, temperature=config.LLM_TEMPERATURE)
+def answer_cache_key(church_id: str, data_version: str, built_at: str, message: str, history: List) -> Optional[Tuple[str, str, str, str]]:
+    """Cache standalone questions. Follow-ups depend on history and stay uncached."""
+    if history:
+        return None
+    normalized = normalize_question(message)
+    if not normalized:
+        return None
+    return (church_id, data_version, built_at or "", normalized)
 
-    # Initialize ChromaDB Client Globally if DB exists
-    vector_db = None
-    if os.path.exists(config.CHROMA_PATH):
-        vector_db = Chroma(persist_directory=config.CHROMA_PATH, embedding_function=embedding_model)
-        print("--- Vector Database Connected ---")
-    else:
-        print("--- WARNING: Vector Database not found. Run ingest.py first. ---")
-        
-    # --- FASTAPI APP ---
-    app = FastAPI(title="Church Assistant API")
+
+def get_cached_answer(key: Tuple[str, str, str, str]) -> Optional["ChatResponse"]:
+    now = time.monotonic()
+    with _cache_lock:
+        hit = _answer_cache.get(key)
+        if not hit:
+            return None
+        expires_at, response = hit
+        if expires_at <= now:
+            _answer_cache.pop(key, None)
+            return None
+        return response.model_copy()
+
+
+def store_cached_answer(key: Tuple[str, str, str, str], response: "ChatResponse") -> None:
+    now = time.monotonic()
+    with _cache_lock:
+        expired = [existing for existing, (expires_at, _) in _answer_cache.items() if expires_at <= now]
+        for existing in expired:
+            _answer_cache.pop(existing, None)
+        _answer_cache[key] = (now + CACHE_TTL_SECONDS, response.model_copy())
+        overflow = len(_answer_cache) - CACHE_MAX
+        if overflow > 0:
+            oldest = sorted(_answer_cache.items(), key=lambda item: item[1][0])[:overflow]
+            for old_key, _ in oldest:
+                _answer_cache.pop(old_key, None)
+
+
+def clear_answer_cache() -> None:
+    with _cache_lock:
+        _answer_cache.clear()
+
+
+class ChatMessage(BaseModel):
+    role: str
+    content: str = Field(..., max_length=4000)
+
+
+class ChatRequest(BaseModel):
+    message: str = Field(..., min_length=1, max_length=2000)
+    history: List[ChatMessage] = Field(default_factory=list, max_length=20)
+    church_id: Optional[str] = None
+
+
+class ChatResponse(BaseModel):
+    response: str
+    sources: List[str]
+    church_id: str
+
+
+def _cors_origins() -> List[str]:
+    if config.ALLOWED_ORIGINS_ENV:
+        return config.ALLOWED_ORIGINS_ENV
+    origins = all_allowed_origins()
+    origins.extend(
+        [
+            "http://localhost:8004",
+            "http://127.0.0.1:8004",
+            "http://localhost:3000",
+            "null",
+        ]
+    )
+    seen = set()
+    out = []
+    for o in origins:
+        if o not in seen:
+            seen.add(o)
+            out.append(o)
+    return out
+
+
+def create_app() -> FastAPI:
+    app = FastAPI(
+        title="Church Assistant API",
+        docs_url=None if config.IS_LAMBDA else "/docs",
+        redoc_url=None if config.IS_LAMBDA else "/redoc",
+    )
 
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["*"],
-        allow_credentials=True,
-        allow_methods=["*"],
-        allow_headers=["*"],
+        allow_origins=_cors_origins(),
+        allow_credentials=False,
+        allow_methods=["GET", "POST", "OPTIONS"],
+        allow_headers=["Content-Type", "X-API-Key"],
     )
 
-    # --- DATA MODELS ---
-    class ChatRequest(BaseModel):
-        message: str
-        history: List[dict] = []
-        use_full_context: bool = False
-        church_id: Optional[str] = None
-
-    class ChatResponse(BaseModel):
-        response: str
-        sources: List[str]
-
-    # --- CHAT ENDPOINT ---
-    @app.post("/chat", response_model=ChatResponse)
-    async def chat(request: ChatRequest):
-        try:
-            # Determine Context
-            church_id = request.church_id
-            context_data = DEFAULT_CONTEXT
-            
-            if church_id and church_id in CHURCH_CONTEXTS:
-                context_data = CHURCH_CONTEXTS[church_id]
-                print(f"--- Using Context for Church ID: {church_id} ---")
-            else:
-                if church_id: print(f"--- Church ID {church_id} not found, using default ---")
-                
-            valid_urls = context_data["valid_urls"]
-            main_domain = context_data["main_domain"]
-            preferred_keyword = context_data.get("preferred_keyword")
-
-            # 1. Database Check
-            if vector_db is None:
-                raise HTTPException(status_code=503, detail="Database not ready. Run ingest.py first.")
-
-            # 2. Retrieve Relevant Context
-            # Prune history to last 4 messages
-            recent_history = request.history[-4:] if len(request.history) > 4 else request.history
-            
-            langchain_history = [
-                HumanMessage(content=msg['content']) if msg['role'] == 'user' else AIMessage(content=msg['content'])
-                for msg in recent_history
-            ]
-
-            final_docs = retrieve_and_rank(request.message, vector_db, valid_urls, preferred_keyword, church_id)
-            
-            # Construct Context Text
-            context_text = "\n\n".join([f"[Source: {d.metadata.get('source', 'unknown')}]\n{d.page_content}" for d in final_docs])
-            # HARD CAP: Limit context
-            if len(context_text) > 15000:
-                context_text = context_text[:15000] + "...(truncated)"
-
-            # Dynamic Contact URL
-            contact_url = "https://google.com"
-            if main_domain: contact_url = main_domain
-            for u in valid_urls:
-                if "/contact" in u or "/connect" in u:
-                    contact_url = u
-                    break
-
-            if not context_text:
-                return ChatResponse(response=f"I apologize, that specific detail isn't available right now. Please visit our [Contact Page]({contact_url}).", sources=[])
-
-            # 3. Generate Answer (Church Assistant Persona)
-            # SYSTEM PROMPT - UNTOUCHED FOR SAFETY
-            prompt_template = ChatPromptTemplate.from_messages([
-                ("system", """You are a warm, welcoming, and helpful digital greeter for a church website.
-                
-            GUIDELINES:
-            1. **Persona & Tone (PRIORITY):** You are a friendly church assistant. BE WARM, CHATTY, AND INVITING.
-                - **MANDATORY:** Start with a warm, conversational sentence BEFORE listing any information.
-                - **NEVER** just output a list. Always speak first.
-            2. **Accuracy (STRICT CONTEXT ONLY):**
-                - **CRITICAL:** You must answer **purely** based on the provided `Context` below.
-                - **DO NOT** use your internal knowledge base to answer general questions (e.g. "What is sex?", "Did Jesus have a wife?", "Who is God?", "What is the Bible?").
-                - If the information is not explicitly present in the `Context`, **DO NOT** attempt to answer it.
-                - **Refusal Message:** If the answer is NOT in the context, say: "I'm not sure about that specific detail based on our website's content, but I'd love to help you find out!" and then provide a link to the **[Contact Page]({{CONTACT_URL}})**.
-                - **CRITICAL:** Use **ONLY** URLs that are explicitly provided in the `Context` below.
-                - **NEVER** invent or guess a URL (e.g. do not make up `/care-support` or `/connect`).
-                - **VERIFICATION:** If a URL you want to use is NOT listed in the `SOURCE:` fields of the context, **DO NOT USE IT.** This is a hard rule.
-            3. **Formatting & Structure (CARDS):**
-                - **To make a "Card" in the chat, you MUST use a bullet point WITH A LINK.**
-                - **Structure:** `* **[Campus Name](url)**: Service A, Service B...`
-                - **Preferred Format:** 
-                  `* **[Campus Name](url)**`
-                  `  * Service A`
-                  `  * Service B`
-            4. **Links & CTA (STRICT DE-DUPLICATION):** 
-                - **NEVER** output multiple bullet points that link to the SAME URL. This is critical.
-                - **Consolidate:** If "Join Group", "Serve", and "Classes" all link to `/connect`, output **ONE** bullet: 
-                  `* [Connect Page](url) - Join a group, serve on a team, or take a class.`
-                - **Visual Check:** If you see the same blue link twice, you have failed. Merge them.
-            5. **Fallbacks & Safety:**
-                - **Plan Your Visit:** if no specific `/visit` or `/plan` page exists, link to the **Home Page**.
-                - **Home Page Links:** When linking to the Home Page, **ALWAYS** use the base URL (e.g. `https://church.com/`). **NEVER** use a sub-page (like `/team/` or `/about/`) as the Home Page link.
-                - **Distress:** Link "Prayer" or "Contact". Avoid specific care groups unless asked.
-                - Compassionate tone.
-            
-            6. **Service Times Logic (CRITICAL):**
-                - **GROUP TIMES BY DAY:** Never list the same day multiple times.
-                    - **BAD:** "Every Sunday at 9:00 AM, Every Sunday at 11:00 AM"
-                    - **GOOD:** "Sundays at 9:00 AM & 11:00 AM"
-                - **NO REPETITION:** Do not use the phrase "Every Sunday" more than once per campus.
-                - **ACCURACY:** Check the context carefully. If a campus lists multiple times (e.g. 9:30 & 11:00), you **MUST** list all of them. Do not skip any.
-                - **Ignore** one-off event times (e.g., "Special Event") unless specifically asked.
-                - **Format:**
-                    `* **[Campus Name](url)**`
-                    `  * Sundays at 9:00 AM & 11:00 AM`
-                - **CRITICAL:** NEVER split a time string (e.g. `4:00 PM`) or date across formatting bold/italics. 
-                - **Keep "Day & Time" together:** Do not put "Saturdays" in the header and "at 5pm" in the body. Keep them in the same bullet point.
-                - **Unique Times:** If multiple locations exist, list times for **each** location clearly.
-                    
-            7. **Link Naming (ACCURACY):**
-                - When creating a link `[Link Text](url)`, the "Link Text" MUST match the actual page title or header found in the context for that URL.
-                - **DO NOT INVENT NAMES.** Do not call a page "Prayer Page" if the title is "Care & Support".
-                    
-            Context: {context}
-            """),
-                *langchain_history,
-                ("human", "{question}")
-            ])
-            
-            chain = prompt_template | llm
-            response = chain.invoke({"context": context_text, "question": request.message})
-            
-            # Inject Dynamic Contact URL
-            pattern = r'(?:\{+\s*CONTACT_URL\s*\}+|%7B\s*CONTACT_URL\s*%7D)'
-            response.content = re.sub(pattern, contact_url, response.content, flags=re.IGNORECASE)
-            
-            # Validate Links
-            validated_content = validate_and_fix_links(response.content, valid_urls, contact_url, main_domain)
-            
-            # Extract Sources
-            unique_sources = list(set([d.metadata.get('source', '') for d in final_docs]))
-            
-            return ChatResponse(response=validated_content, sources=unique_sources)
-
-        except Exception as e:
-            # Catch-all for runtime errors (like OpenAI timeouts, Pydantic validation)
-            print(f"CRITICAL CHAT ERROR: {e}")
-            traceback.print_exc()
-            return JSONResponse(status_code=500, content={"error": f"Internal Server Error: {str(e)}"})
-
-    @app.get("/church_chatbot.js", response_class=FileResponse)
-    async def get_widget_js():
-        return os.path.join(config.BASE_DIR, "church_chatbot.js")
-
-    @app.get("/", response_class=HTMLResponse)
-    async def get_widget():
-        widget_path = os.path.join(config.BASE_DIR, "widget_demo.html")
-        with open(widget_path, "r", encoding="utf-8") as f:
-            return f.read()
-
-except Exception as e:
-    # --- FALLBACK APP FOR DEBUGGING ---
-    print(f"CRITICAL BOOT ERROR: {e}")
-    GLOBAL_BOOT_ERROR = traceback.format_exc()
-    app = FastAPI(title="Broken Boot App")
-
-    @app.get("/{path:path}")
-    @app.post("/{path:path}")
-    def catch_all(path: str):
+    @app.exception_handler(Exception)
+    async def unhandled_exception_handler(request: Request, exc: Exception):
+        request_id = request.headers.get("x-amzn-requestid") or request.headers.get("x-request-id")
+        logger.error(
+            "unhandled_error",
+            extra={"extra_fields": {"path": str(request.url.path), "error": str(exc), "request_id": request_id}},
+        )
+        logger.debug(traceback.format_exc())
         return JSONResponse(
-            status_code=500, 
+            status_code=500,
             content={
-                "error": "Application Failed to Start", 
-                "traceback": GLOBAL_BOOT_ERROR,
-                "cwd": os.getcwd(),
-                "files": os.listdir(os.getcwd()) if os.path.exists(os.getcwd()) else []
+                "error": {
+                    "code": "internal_error",
+                    "message": "Internal server error",
+                    "request_id": request_id,
+                }
+            },
+        )
+
+    @app.exception_handler(RequestValidationError)
+    async def validation_exception_handler(request: Request, exc: RequestValidationError):
+        return JSONResponse(
+            status_code=422,
+            content={
+                "error": {
+                    "code": "validation_error",
+                    "message": "Invalid request",
+                    "details": exc.errors(),
+                }
+            },
+        )
+
+    @app.get("/health")
+    async def health(church_id: Optional[str] = None):
+        cid = church_id or config.DEFAULT_CHURCH_ID
+        try:
+            state = get_state(cid)
+        except Exception as e:
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "status": "degraded",
+                    "church_id": cid,
+                    "ready": False,
+                    "error": str(e),
+                },
+            )
+
+        remote = None
+        stale = False
+        if config.S3_BUCKET_NAME:
+            remote = head_remote_manifest(config.S3_BUCKET_NAME, cid)
+            local_built = (state.manifest or {}).get("built_at")
+            remote_built = (remote or {}).get("built_at")
+            stale = bool(remote_built and local_built and remote_built != local_built)
+
+        return {
+            "status": "ok" if not stale else "stale",
+            "ready": True,
+            "church_id": cid,
+            "church_name": state.church.name,
+            "pages": state.context.page_count,
+            "manifest": state.manifest,
+            "remote_manifest": remote,
+            "stale": stale,
+            "data_version": config.DATA_VERSION,
+            "registered_churches": list_church_ids(),
+        }
+
+    @app.get("/churches")
+    async def churches():
+        return {
+            "churches": [
+                {
+                    "id": cid,
+                    "name": get_church(cid).name,
+                    "domain": get_church(cid).domain,
+                }
+                for cid in list_church_ids()
+            ]
+        }
+
+    @app.post("/admin/reload", dependencies=[Depends(require_api_key)])
+    async def admin_reload(church_id: Optional[str] = None):
+        if not config.API_KEYS and config.IS_LAMBDA:
+            raise HTTPException(status_code=401, detail="API_KEYS must be configured for admin endpoints")
+        cid = church_id or config.DEFAULT_CHURCH_ID
+        state = reload_state(cid)
+        return {
+            "status": "reloaded",
+            "church_id": cid,
+            "pages": state.context.page_count,
+            "manifest": state.manifest,
+        }
+
+    @app.post("/chat", response_model=ChatResponse, dependencies=[Depends(require_api_key)])
+    async def chat(request: ChatRequest):
+        church_id = request.church_id or config.DEFAULT_CHURCH_ID
+        try:
+            get_church(church_id)
+        except UnknownChurchError as e:
+            raise HTTPException(status_code=404, detail=str(e)) from e
+
+        try:
+            state = get_state(church_id)
+        except FileNotFoundError as e:
+            raise HTTPException(status_code=503, detail=str(e)) from e
+        except Exception as e:
+            logger.exception("state_load_failed", extra={"extra_fields": {"church_id": church_id}})
+            raise HTTPException(status_code=503, detail="Knowledge base unavailable") from e
+
+        recent_history = request.history[-8:]
+        built_at = str((state.manifest or {}).get("built_at") or "")
+        cache_key = answer_cache_key(
+            church_id,
+            config.DATA_VERSION,
+            built_at,
+            request.message,
+            recent_history,
+        )
+        if cache_key:
+            cached = get_cached_answer(cache_key)
+            if cached is not None:
+                logger.info("chat_cache_hit", extra={"extra_fields": {"church_id": church_id}})
+                return cached
+
+        langchain_history = [
+            HumanMessage(content=msg.content) if msg.role == "user" else AIMessage(content=msg.content)
+            for msg in recent_history
+        ]
+
+        final_docs = retrieve_and_rank(
+            build_search_query(request.message, recent_history),
+            state.vector_db,
+            state.valid_urls,
+            state.preferred_keyword,
+            church_id,
+            state.church.retrieval,
+        )
+
+        parts = []
+        total = 0
+        for d in final_docs:
+            block = f"[Source: {d.metadata.get('source', 'unknown')}]\n{d.page_content}"
+            if total + len(block) > CONTEXT_CHAR_LIMIT:
+                break
+            parts.append(block)
+            total += len(block)
+        context_text = "\n\n".join(parts)
+
+        contact_url = state.main_domain or f"https://{state.church.domain}"
+        for u in state.valid_urls:
+            if "/contact" in u or "/connect" in u:
+                contact_url = u
+                break
+
+        if not context_text:
+            empty = ChatResponse(
+                response=(
+                    f"I apologize, that specific detail isn't available right now. "
+                    f"Please visit our [Contact Page]({contact_url})."
+                ),
+                sources=[],
+                church_id=church_id,
+            )
+            if cache_key:
+                store_cached_answer(cache_key, empty)
+            return empty
+
+        prompt_template = ChatPromptTemplate.from_messages(
+            [
+                (
+                    "system",
+                    """You are a warm, welcoming, and helpful digital greeter for {church_name}.
+
+1. **Persona:** Be a warm, friendly church assistant. ALWAYS start with a conversational sentence.
+2. **Strict Accuracy:** Answer **ONLY** using the provided `Context`.
+    - **NO Outside Knowledge:** Do not answer general questions (e.g. theology, biology) not in text.
+    - **Missing Info:** If answer is not in context, say: "I'm not sure about that specific detail based on our website, but I'd love to help!" and link to **[Contact Page]({{CONTACT_URL}})**.
+    - **Links:** Use **ONLY** URLs from `Context`. Never invent URLs.
+3. **Formatting (Cards):**
+    - Use bullet points with links for lists: `* **[Campus Name](url)**`
+    - Deduplicate links: Merge multiple topics (groups, serve) into one bullet if they share a URL.
+4. **Service Times:**
+    - Use only the days and clock times written on that campus's own page in the Context.
+    - Keep campuses separate. Never copy one campus's times onto another.
+    - Times under "join us online" or "watch online" are online only. Do not attach them to a campus.
+    - Include Saturday when that campus page lists Saturday.
+    - If a campus is named but its own page is not in the Context, say you do not have that campus's times. Do not guess a schedule.
+5. **Giving:**
+    - **Methods Only:** List giving methods: Online, Text, Mail, In-Person.
+    - **Do NOT list campuses** as giving options unless identifying a physical drop-off.
+    - **No "Online Campus":** Never invent an "Online Campus" entity.
+6. **Fallbacks:**
+    - If a specific page is missing, link to **Home Page** or **Contact Page**.
+    - Link text must match page titles in context.
+Context: {context}
+""",
+                ),
+                *langchain_history,
+                ("human", "{question}"),
+            ]
+        )
+
+        chain = prompt_template | state.llm
+        response = chain.invoke(
+            {
+                "context": context_text,
+                "question": request.message,
+                "church_name": state.church.name,
             }
         )
 
-# --- MANGUM HANDLER (Always Created) ---
-from mangum import Mangum
-handler = Mangum(app)
+        content = response.content if hasattr(response, "content") else str(response)
+        pattern = r"(?:\{+\s*CONTACT_URL\s*\}+|%7B\s*CONTACT_URL\s*%7D)"
+        content = re.sub(pattern, contact_url, content, flags=re.IGNORECASE)
+        validated = validate_and_fix_links(content, state.valid_urls, contact_url, state.main_domain)
+        unique_sources = list({d.metadata.get("source", "") for d in final_docs if d.metadata.get("source")})
+
+        result = ChatResponse(response=validated, sources=unique_sources, church_id=church_id)
+        if cache_key:
+            store_cached_answer(cache_key, result)
+        return result
+
+    @app.get("/church_chatbot.js")
+    async def get_widget_js():
+        path = config.BASE_DIR / "church_chatbot.js"
+        return FileResponse(path, media_type="application/javascript")
+
+    @app.get("/", response_class=HTMLResponse)
+    async def get_widget():
+        widget_path = config.BASE_DIR / "widget_demo.html"
+        return widget_path.read_text(encoding="utf-8")
+
+    return app
+
+
+app = create_app()
+_mangum_handler = None
+
+
+def handler(event, context):
+    """Chat Lambda entrypoint (slim image — no scrape/updater imports)."""
+    global _mangum_handler
+    if _mangum_handler is None:
+        from mangum import Mangum
+
+        _mangum_handler = Mangum(app)
+    return _mangum_handler(event, context)
+
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8004)
+
+    uvicorn.run("server:app", host="0.0.0.0", port=config.PORT, reload=False)

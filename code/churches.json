@@ -1,0 +1,53 @@
+{
+  "schema_version": 1,
+  "churches": {
+    "heritage": {
+      "name": "Heritage Church",
+      "domain": "heritagechurch.com",
+      "start_url": "https://heritagechurch.com",
+      "max_pages": 400,
+      "preferred_keyword": null,
+      "allowed_origins": [
+        "https://heritagechurch.com",
+        "https://www.heritagechurch.com"
+      ],
+      "retrieval": {
+        "high_value": [
+          "service", "location", "campus", "visit", "time", "about",
+          "connect", "new", "give", "giving", "donate", "team",
+          "staff", "who-we-are", "leadership", "youth", "kid",
+          "child", "student", "christmas"
+        ],
+        "low_value": [
+          "event", "pantry", "easter", "calendar", "blog",
+          "news", "message", "sermon"
+        ],
+        "intents": [
+          {
+            "any": ["visit", "new"],
+            "all": ["service", "times"],
+            "paths": ["/locations/", "/campuses/", "/contact", "/visit"],
+            "include_site_root": true,
+            "prefer_specific": true,
+            "limit": 6
+          },
+          {
+            "any": ["give", "giving", "donate", "tithe"],
+            "paths": ["/give", "/giving", "/donate"],
+            "limit": 2
+          },
+          {
+            "any": ["pastor", "team", "staff", "leader"],
+            "paths": ["/team", "/staff", "/leadership", "/who-we-are", "/about"],
+            "limit": 3
+          },
+          {
+            "any": ["youth", "kid", "child", "student", "teen"],
+            "paths": ["/youth", "/kid", "/child", "/student"],
+            "limit": 3
+          }
+        ]
+      }
+    }
+  }
+}

@@ -1,0 +1,15 @@
+# Chat image — answers questions. No browser.
+FROM public.ecr.aws/lambda/python:3.12
+
+COPY requirements-chat.txt .
+RUN pip install --no-cache-dir -r requirements-chat.txt
+
+COPY code/ ${LAMBDA_TASK_ROOT}/code/
+
+ENV PYTHONPATH=${LAMBDA_TASK_ROOT}/code
+ENV TIKTOKEN_CACHE_DIR=/tmp
+
+WORKDIR ${LAMBDA_TASK_ROOT}/code
+
+# AWS Lambda Python base already provides the runtime interface
+CMD ["server.handler"]

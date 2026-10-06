@@ -1,133 +1,198 @@
-from typing import List, Set, Optional
-from langchain_chroma import Chroma
+"""Hybrid retrieval: one embedding, intent page injection, blended ranking."""
+from __future__ import annotations
+
+import re
+from typing import Any, List, Optional, Sequence, Set, Tuple
+from urllib.parse import urlparse
+
 from langchain_core.documents import Document
 
-import config
+RESULT_LIMIT = 6
+SEMANTIC_K = 20
+CONTEXT_CHAR_LIMIT = 8000
+FORCED_RELEVANCE = 0.70
+
+HIGH_VALUE_BONUS = 0.12
+LOW_VALUE_PENALTY = 0.28
+PREFERRED_BONUS = 0.05
+CAMPUS_BONUS = 0.40
+ROOT_BONUS = 0.20
+_TIME_TEXT = re.compile(
+    r"\b(?:sun|mon|tues|wednes|thurs|fri|satur)day\b|\b\d{1,2}:\d{2}\s*(?:a\.?m\.?|p\.?m\.?)\b",
+    re.IGNORECASE,
+)
+
+
+def build_search_query(message: str, history: Sequence[Any]) -> str:
+    """Search with the previous visitor question so follow-ups keep their topic."""
+    previous = ""
+    for msg in reversed(list(history)):
+        role = getattr(msg, "role", None)
+        content = getattr(msg, "content", None)
+        if role is None and isinstance(msg, dict):
+            role = msg.get("role")
+            content = msg.get("content")
+        if role == "user" and isinstance(content, str) and content.strip():
+            previous = content.strip()
+            break
+    current = message.strip()
+    if previous and previous.lower() != current.lower():
+        return f"{previous}\n{current}"
+    return current
+
+
+def _intent_matches(query: str, intent: Any) -> bool:
+    if intent.any_terms and any(term in query for term in intent.any_terms):
+        return True
+    if intent.all_terms and all(term in query for term in intent.all_terms):
+        return True
+    return False
+
+
+def urls_for_intent(valid_urls: Set[str], intent: Any) -> List[str]:
+    matched: List[str] = []
+    for url in valid_urls:
+        lower = url.lower()
+        if any(path in lower for path in intent.paths):
+            matched.append(url)
+            continue
+        if intent.include_site_root and url.rstrip("/").count("/") == 2:
+            matched.append(url)
+    if getattr(intent, "prefer_specific", False):
+        matched.sort(key=_location_specificity, reverse=True)
+    else:
+        matched.sort(key=len)
+    return matched[: max(intent.limit, 0)]
+
+
+def _location_specificity(url: str) -> Tuple[int, int]:
+    """Campus pages outrank the short locations index."""
+    parts = [part for part in urlparse(url).path.split("/") if part]
+    campus_page = 1 if len(parts) >= 2 and parts[0] in ("locations", "campuses") else 0
+    return (campus_page, len(parts))
+
+
+def _documents_for_church(vector_db: Any, church_id: Optional[str]) -> List[Document]:
+    where = {"church_id": church_id} if church_id else None
+    raw = vector_db.get(where=where, include=["documents", "metadatas"])
+    documents = (raw or {}).get("documents") or []
+    metadatas = (raw or {}).get("metadatas") or []
+    docs: List[Document] = []
+    for text, meta in zip(documents, metadatas):
+        if not text:
+            continue
+        docs.append(Document(page_content=text, metadata=dict(meta or {})))
+    return docs
+
+
+def _wants_service_times(query: str) -> bool:
+    lowered = query.lower()
+    return any(word in lowered for word in ("time", "service", "sunday", "saturday", "when"))
+
+
+def _best_chunk_per_url(
+    docs: Sequence[Document],
+    urls: Sequence[str],
+    query: str = "",
+) -> List[Document]:
+    wanted = {url.rstrip("/") for url in urls}
+    prefer_times = _wants_service_times(query)
+    chosen = {}
+    for doc in docs:
+        source = (doc.metadata.get("source") or "").rstrip("/")
+        if source not in wanted:
+            continue
+        current = chosen.get(source)
+        if current is None or _chunk_rank(doc, prefer_times) > _chunk_rank(current, prefer_times):
+            chosen[source] = doc
+    return list(chosen.values())
+
+
+def _chunk_rank(doc: Document, prefer_times: bool) -> Tuple[int, int]:
+    hits = len(_TIME_TEXT.findall(doc.page_content)) if prefer_times else 0
+    return (hits, len(doc.page_content))
+
+
+def url_adjustment(
+    source: str,
+    query: str,
+    valid_urls: Set[str],
+    preferred_campus_keyword: Optional[str],
+    profile: Any,
+) -> float:
+    lowered = source.lower()
+    score = 0.0
+    if any(sub in lowered for sub in profile.high_value):
+        score += HIGH_VALUE_BONUS
+    if any(sub in lowered for sub in profile.low_value):
+        score -= LOW_VALUE_PENALTY
+    if preferred_campus_keyword and preferred_campus_keyword.lower() in lowered:
+        score += PREFERRED_BONUS
+
+    normalized_query = query.lower().replace(" ", "-")
+    for url in valid_urls:
+        slug = url.rstrip("/").split("/")[-1].lower()
+        if slug and slug in normalized_query and slug in lowered:
+            score += CAMPUS_BONUS
+            break
+
+    if lowered.rstrip("/").count("/") == 2:
+        score += ROOT_BONUS
+    return score
+
+
+def _signature(doc: Document) -> Tuple[str, str]:
+    return (doc.metadata.get("source", ""), doc.page_content[:100])
+
 
 def retrieve_and_rank(
     query: str,
-    vector_db: Chroma,
+    vector_db: Any,
     valid_urls: Set[str],
     preferred_campus_keyword: Optional[str] = None,
-    church_id: Optional[str] = None
+    church_id: Optional[str] = None,
+    profile: Any = None,
 ) -> List[Document]:
-    """
-    Performs hybrid retrieval (forced injection + semantic search) and custom scoring/ranking.
-    """
-    
-    forced_docs = []
-    
-    # Helper to build filter
-    def build_filter(source_url=None):
-        if church_id and source_url:
-            return {"$and": [{"church_id": church_id}, {"source": source_url}]}
-        elif church_id:
-            return {"church_id": church_id}
-        elif source_url:
-            return {"source": source_url}
-        return None
+    """Embed the question once, inject intent pages from metadata, blend scores."""
+    if profile is None:
+        from registry import DEFAULT_RETRIEVAL
 
-    # 1. Force Injection Logic
-    
-    # A. Generic Service Times / Visit
-    if ("service" in query.lower() and "times" in query.lower()) or \
-       ("new" in query.lower()) or \
-       ("visit" in query.lower()):
-        print("--- DETECTED GENERIC SERVICE TIME QUERY: INJECTING LOCATIONS ---")
-        location_urls = [u for u in valid_urls if "/locations/" in u or "/campuses/" in u or "/contact" in u or "/visit" in u or u.rstrip("/").count("/") == 2] 
-        # OPTIMIZATION: Limit to top 4 shortest URLs to prevent timeout (generic queries shouldn't scan 50 subpages)
-        location_urls.sort(key=len)
-        location_urls = location_urls[:4]
-        
-        for url in location_urls:
-             # Apply church_id filter if present
-             f = build_filter(url)
-             hits = vector_db.similarity_search("service times", k=1, filter=f)
-             forced_docs.extend(hits)
+        profile = DEFAULT_RETRIEVAL
 
-    # B. Giving
-    if any(q in query.lower() for q in ["give", "giving", "donate", "tithe"]):
-        print("--- DETECTED GIVING QUERY: INJECTING GIVING PAGES ---")
-        giving_urls = [u for u in valid_urls if "/give" in u or "/giving" in u or "/donate" in u]
-        # OPTIMIZATION: Limit to 2
-        giving_urls.sort(key=len)
-        for url in giving_urls[:2]:
-             f = build_filter(url)
-             hits = vector_db.similarity_search("giving", k=1, filter=f)
-             forced_docs.extend(hits)
+    q = query.lower()
+    forced_urls: List[str] = []
+    for intent in profile.intents:
+        if _intent_matches(q, intent):
+            forced_urls.extend(urls_for_intent(valid_urls, intent))
 
-    # C. Team/Staff
-    if any(q in query.lower() for q in ["pastor", "team", "staff", "leader", "who"]):
-        print("--- DETECTED TEAM QUERY: INJECTING TEAM PAGES ---")
-        team_urls = [u for u in valid_urls if "/team" in u or "/staff" in u or "/leadership" in u or "/who-we-are" in u or "/about" in u]
-        # OPTIMIZATION: Limit to 3 shortest (likely main staff page)
-        team_urls.sort(key=len)
-        for url in team_urls[:3]:
-             f = build_filter(url)
-             hits = vector_db.similarity_search("pastors staff team", k=1, filter=f)
-             forced_docs.extend(hits)
+    forced_docs: List[Document] = []
+    if forced_urls:
+        stored = _documents_for_church(vector_db, church_id)
+        forced_docs = _best_chunk_per_url(stored, forced_urls, query)
 
-    # D. Youth/Kids
-    if any(q in query.lower() for q in ["youth", "kid", "child", "student", "teen"]):
-        print("--- DETECTED YOUTH/KIDS QUERY: INJECTING YOUTH/KIDS PAGES ---")
-        ministry_urls = [u for u in valid_urls if "/youth" in u or "/kid" in u or "/child" in u or "/student" in u]
-        # OPTIMIZATION: Limit to 3
-        ministry_urls.sort(key=len)
-        for url in ministry_urls[:3]:
-             f = build_filter(url)
-             hits = vector_db.similarity_search("youth kids ministry", k=1, filter=f)
-             forced_docs.extend(hits)
-    
-    # 2. Standard Semantic Retrieval (MMR)
-    search_kwargs = {"k": 60, "fetch_k": 100}
+    search_kwargs = {"k": SEMANTIC_K}
     if church_id:
         search_kwargs["filter"] = {"church_id": church_id}
-        
-    retriever = vector_db.as_retriever(search_type="mmr", search_kwargs=search_kwargs)
-    raw_docs = retriever.invoke(query)
-    
-    # 3. Combine & Deduplicate
-    combined_docs = forced_docs + raw_docs
-    unique_docs_map = {}
-    for doc in combined_docs:
-        # Dedupe by source + first 100 chars
-        signature = (doc.metadata.get("source", ""), doc.page_content[:100])
-        if signature not in unique_docs_map:
-            unique_docs_map[signature] = doc
-    
-    candidates = list(unique_docs_map.values())
+    ranked_pairs = vector_db.similarity_search_with_relevance_scores(query, **search_kwargs)
 
-    # 4. Scoring / Re-Ranking
-    scored_docs = []
-    
-    # Dynamic Campus Boosting: Check if user mentioned a specific campus
-    mentioned_campus_slug = None
-    for url in valid_urls:
-        slug = url.rstrip("/").split("/")[-1].lower()
-        if slug in query.lower().replace(" ", "-"):
-            mentioned_campus_slug = slug
-            break
-            
-    for doc in candidates:
-        source = doc.metadata.get("source", "").lower()
-        score = 0
-        
-        if any(sub in source for sub in config.HIGH_VALUE_SUBSTRINGS): score += 5
-        if any(sub in source for sub in config.LOW_VALUE_SUBSTRINGS): score -= 10
-        
-        # Context Boost
-        if preferred_campus_keyword and preferred_campus_keyword in source:
-            score += 2 
-            
-        # Explicit Campus Request Boost
-        if mentioned_campus_slug and mentioned_campus_slug in source:
-            score += 25
-            
-        # Root Domain Boost
-        if source.rstrip("/").count("/") == 2:
-            score += 15
-        
-        scored_docs.append((doc, score))
-        
-    scored_docs.sort(key=lambda x: x[1], reverse=True)
-    return [d[0] for d in scored_docs[:10]]
+    merged = {}
+    for doc, relevance in ranked_pairs:
+        merged[_signature(doc)] = (doc, float(relevance))
+    for doc in forced_docs:
+        signature = _signature(doc)
+        if signature not in merged:
+            merged[signature] = (doc, FORCED_RELEVANCE)
+
+    if not merged:
+        return []
+
+    scored = []
+    for doc, relevance in merged.values():
+        source = doc.metadata.get("source", "")
+        final = relevance + url_adjustment(
+            source, query, valid_urls, preferred_campus_keyword, profile
+        )
+        scored.append((doc, final))
+
+    scored.sort(key=lambda item: item[1], reverse=True)
+    return [doc for doc, _score in scored[:RESULT_LIMIT]]

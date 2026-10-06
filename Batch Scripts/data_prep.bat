@@ -1,85 +1,31 @@
 @echo off
-:: The script is in "Batch Scripts" folder, so we use cd .. to get to project root
+setlocal
+cd /d "%~dp0.."
 
-:: 1. Force the script to start in its own directory
-cd /d "%~dp0"
-
-:: 2. Move up one level to the Project Root
-cd ..
-
-ECHO ==========================================
-ECHO          Current Folder: %CD%
-ECHO ==========================================
-
-:: 3. Verification Check (unchanged)
-if not exist "requirements.txt" (
-    ECHO [ERROR] requirements.txt missing!
-    ECHO expected to find it in: %CD%
-    pause
-    exit /b
+if not exist "venv\Scripts\activate.bat" (
+  echo Creating venv...
+  python -m venv venv
 )
-
-:: 4. Create Venv (unchanged)
-if not exist "venv" (
-    ECHO Creating venv...
-    python -m venv venv
-)
-
-:: 5. Activate (unchanged)
 call venv\Scripts\activate.bat
 
-ECHO.
-ECHO --- Stabilizing Playwright Dependencies ---
-:: Playwright browsers often get corrupted. Reinstalling them fixes most crashes.
-    call venv\Scripts\python.exe -m pip install -r requirements.txt
-    
-    ECHO.
-    
-    :: --- Get URL Input ---
-    SET target_url=
-    SET /P target_url=Please enter the Church Website URL: 
-    
-    :: --- CRITICAL: URL EMPTY CHECK ---
-    IF "%target_url%"=="" (
-        ECHO.
-        ECHO [ERROR] Input cannot be empty! Please provide a valid URL.
-        PAUSE
-        EXIT /B 1
-    )
-    
-    ECHO.
-    ECHO Target URL set to: %target_url%
-    ECHO ----------------------------------------------------------
-    
-    :: Run the webscraping script, passing the URL as the first argument
-    :: We use START /WAIT to ensure the batch script waits correctly for the python process
-    :: Run the webscraping script directly so output is visible
-    venv\Scripts\python.exe code\webscrape.py "%target_url%"
-    IF ERRORLEVEL 1 (
-        ECHO.
-        ECHO Webscrape failed.
-        PAUSE
-        EXIT /B 1
-    )
+set CHURCH_ID=%1
+if "%CHURCH_ID%"=="" set CHURCH_ID=heritage
+set TARGET_URL=%2
 
-
-ECHO.
-ECHO [2/2] Running Data Ingestion (ingest.py)...
-ECHO (Converting scraped data to vector embeddings...)
-ECHO.
-ECHO [2/2] Running Data Ingestion (ingest.py)...
-ECHO (Converting scraped data to vector embeddings...)
-venv\Scripts\python.exe code\ingest.py --reset
-IF ERRORLEVEL 1 (
-    ECHO.
-    ECHO Ingest failed. See error messages above.
-    PAUSE
-    EXIT /B 1
+if not "%TARGET_URL%"=="" (
+  echo Custom URL scrape for %CHURCH_ID% at %TARGET_URL%
+  if not exist ".runtime\%CHURCH_ID%" mkdir ".runtime\%CHURCH_ID%"
+  python code\webscrape.py "%TARGET_URL%" --output_file ".runtime\%CHURCH_ID%\scraped_data.jsonl"
+  if errorlevel 1 exit /b 1
+  python code\ingest.py --church_id %CHURCH_ID% --input_file ".runtime\%CHURCH_ID%\scraped_data.jsonl" --reset
+  if errorlevel 1 exit /b 1
+) else (
+  echo Building local bundle for registered church: %CHURCH_ID%
+  python code\updater.py --church_id %CHURCH_ID% --dry-run
+  if errorlevel 1 exit /b 1
 )
 
-ECHO ----------------------------------------------------------
-ECHO ✅ Data preparation complete! Database is updated.
-ECHO --- You can now launch the API server via launch_server.bat ---
-
-:: Keep the window open so you can see the results/logs
-PAUSE
+echo.
+echo Local data ready under .runtime\%CHURCH_ID%\
+echo Start the API with Batch Scripts\launch_server.bat
+endlocal

@@ -1,24 +1,31 @@
-# Environment Variables (Secrets)
+# Secrets
 .env
+.env.*
+!.env.example
 
-# Virtual Environment
+# Virtual environments
 venv/
 env/
 
-# Python Compiled Files
+# Python
 __pycache__/
 *.py[cod]
+.pytest_cache/
+.ruff_cache/
 
-# Database & Scraped Data (Generated Content)
-# chroma_db/  <-- Commented out for Demo Deployment
-# *.jsonl     <-- Commented out for Demo Deployment
-scraped_data_*.json
+# Generated data (regenerate via scraper / updater)
+chroma_db/
+.runtime/
+scraped_data*.jsonl
+*.zip
 
-# IDE Settings
+# IDE / tooling
 .idea/
 .vscode/
+.zenflow/
+.zencoder/
 
-# System Files
+# OS
 .DS_Store
 Thumbs.db
 

@@ -1,0 +1,31 @@
+# Security
+.env
+.env.*
+
+# Local environment
+venv/
+env/
+.idea/
+.vscode/
+.zenflow/
+.zencoder/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+
+# Git
+.git/
+
+# Local scripts & docs (not needed in Lambda image)
+Batch Scripts/
+examples/
+README.md
+code/tests/
+code/test_server.py
+
+# Generated / large data — load from S3 at runtime
+chroma_db/
+.runtime/
+*.zip
+*.jsonl

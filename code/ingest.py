@@ -1,129 +1,150 @@
-import os
-import sys
-import json
-import shutil
-import warnings
+"""Ingest scraped JSONL into a per-church Chroma vector store."""
+from __future__ import annotations
+
 import argparse
+import json
+import logging
+import shutil
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+from typing import List, Optional
 
 from langchain_chroma import Chroma
-from langchain_openai import OpenAIEmbeddings
-from langchain_community.document_loaders import JSONLoader
-from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_core.documents import Document
+from langchain_openai import OpenAIEmbeddings
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 import config
+from context_manager import is_useful_page
+from logging_config import setup_logging
 
-def main():
-    parser = argparse.ArgumentParser(description="Ingest Church Data")
-    parser.add_argument("--church_id", type=str, default="heritage", help="Unique ID for the church (default: 'heritage')")
-    parser.add_argument("--input_file", type=str, default="scraped_data.jsonl", help="Input JSONL file")
-    parser.add_argument("--reset", action="store_true", help="Wipe the entire database before ingesting")
-    
-    args = parser.parse_args()
+logger = setup_logging()
 
-    print("="*50)
-    print("   INGESTING KNOWLEDGE BASE")
-    
-    # Handle DB Reset
-    if args.reset:
-        if os.path.exists(config.CHROMA_PATH):
-            try:
-                shutil.rmtree(config.CHROMA_PATH)
-                print(f"   [RESET] Cleared existing database at {config.CHROMA_PATH}")
-            except PermissionError:
-                print(f"[ERROR] Could not clear DB. Server might be running.", file=sys.stderr)
-                sys.exit(1)
-            except Exception as e:
-                print(f"[ERROR] {e}", file=sys.stderr)
-                sys.exit(1)
-        os.makedirs(config.CHROMA_PATH, exist_ok=True)
-    else:
-        print(f"   [INFO] Appending to existing database at {config.CHROMA_PATH}")
-        
-    # --- LOAD MODEL ONCE (Optimization) ---
-    print(f"   [INFO] Loading Embedding Model ({config.EMBEDDING_MODEL_NAME})...")
-    embedding_model = OpenAIEmbeddings(model=config.EMBEDDING_MODEL_NAME)
 
-    # PRE-CLEANUP: If we are appending for a specific church, we must delete OLD data
-    # Now we reuse the already loaded `embedding_model`
-    if not args.reset and args.church_id:
-        try:
-            print(f"   [INFO] Removing old data for church_id: {args.church_id}")
-            temp_db = Chroma(persist_directory=config.CHROMA_PATH, embedding_function=embedding_model)
-            
-            # Retrieve all docs to find IDs
-            existing_docs = temp_db.get(where={"church_id": args.church_id})
-            if existing_docs and existing_docs['ids']:
-                ids_to_delete = existing_docs['ids']
-                print(f"   [INFO] Deleting {len(ids_to_delete)} existing chunks for this church...")
-                temp_db.delete(ids=ids_to_delete)
-            else:
-                print("   [INFO] No existing data found for this church.")
-        except Exception as e:
-            print(f"   [WARN] Could not clean up old data: {e}")
+@dataclass
+class IngestResult:
+    church_id: str
+    pages: int
+    chunks: int
+    chroma_path: str
 
-    # Determine Input File
-    if os.path.isabs(args.input_file):
-        data_path = args.input_file
-    else:
-        # Check current dir first, then project root fallback
-        if os.path.exists(args.input_file):
-            data_path = os.path.abspath(args.input_file)
-        else:
-            data_path = os.path.join(config.PROJECT_ROOT, args.input_file)
 
-    if not os.path.exists(data_path):
-        print(f"[ERROR] Data file not found: {data_path}", file=sys.stderr)
-        sys.exit(1)
-
-    # 1. Load Documents
-    documents = []
+def _load_documents(data_path: Path, church_id: str) -> List[Document]:
+    documents: List[Document] = []
     with open(data_path, "r", encoding="utf-8") as f:
         for line in f:
-            if line.strip():
-                try:
-                    data = json.loads(line)
-                    # Support both formats (source/url)
-                    src = data.get("source") or data.get("url")
-                    if not src: continue
+            if not line.strip():
+                continue
+            try:
+                data = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            src = data.get("source") or data.get("url")
+            content = data.get("content") or data.get("text") or ""
+            if not src or not is_useful_page(content):
+                continue
+            documents.append(
+                Document(
+                    page_content=content,
+                    metadata={"source": src, "church_id": church_id},
+                )
+            )
+    return documents
 
-                    metadata = {"source": src}
-                    if args.church_id:
-                        metadata["church_id"] = args.church_id
-                        
-                    doc = Document(
-                        page_content=data["content"] or data.get("text", ""),
-                        metadata=metadata
-                    )
-                    documents.append(doc)
-                except:
-                    continue
-    
-    print(f"   Loaded {len(documents)} distinct pages from {args.input_file}.")
 
-    # 2. Split Text
-    text_splitter = RecursiveCharacterTextSplitter(
+def ingest_records(
+    church_id: str,
+    input_file: str | Path,
+    reset: bool = False,
+    chroma_dir: Optional[str | Path] = None,
+) -> IngestResult:
+    config.require_openai_key()
+    data_path = Path(input_file)
+    if not data_path.exists():
+        raise FileNotFoundError(f"Data file not found: {data_path}")
+
+    persist_dir = Path(chroma_dir) if chroma_dir else config.chroma_path(church_id)
+    persist_dir.parent.mkdir(parents=True, exist_ok=True)
+
+    if reset and persist_dir.exists():
+        shutil.rmtree(persist_dir)
+        logger.info("chroma_reset", extra={"extra_fields": {"path": str(persist_dir)}})
+
+    persist_dir.mkdir(parents=True, exist_ok=True)
+
+    embedding_model = OpenAIEmbeddings(model=config.EMBEDDING_MODEL_NAME)
+    db = Chroma(persist_directory=str(persist_dir), embedding_function=embedding_model)
+
+    if not reset:
+        try:
+            existing = db.get(where={"church_id": church_id})
+            ids = (existing or {}).get("ids") or []
+            if ids:
+                db.delete(ids=ids)
+                logger.info(
+                    "chroma_church_cleared",
+                    extra={"extra_fields": {"church_id": church_id, "deleted": len(ids)}},
+                )
+        except Exception as e:
+            logger.warning("chroma_cleanup_failed", extra={"extra_fields": {"error": str(e)}})
+
+    documents = _load_documents(data_path, church_id)
+    if not documents:
+        raise RuntimeError(f"No useful pages to ingest from {data_path}")
+
+    splitter = RecursiveCharacterTextSplitter(
         chunk_size=2000,
         chunk_overlap=300,
-        separators=["\n\n", "\n", "###", "##", " ", ""]
+        separators=["\n\n", "\n", "###", "##", " ", ""],
     )
-    chunks = text_splitter.split_documents(documents)
-    print(f"   Created {len(chunks)} searchable chunks.")
+    chunks = splitter.split_documents(documents)
 
-    # 3. Vectorize
-    # Reuse the model loaded earlier
-    BATCH_SIZE = 50
-    for i in range(0, len(chunks), BATCH_SIZE):
-        batch = chunks[i:i+BATCH_SIZE]
-        Chroma.from_documents(
-            documents=batch,
-            embedding=embedding_model,
-            persist_directory=config.CHROMA_PATH
+    batch_size = 50
+    for i in range(0, len(chunks), batch_size):
+        batch = chunks[i : i + batch_size]
+        db.add_documents(batch)
+        logger.info(
+            "ingest_batch",
+            extra={"extra_fields": {"batch": i // batch_size + 1, "size": len(batch)}},
         )
-        print(f"   Processed batch {i//BATCH_SIZE + 1}...")
 
-    print("-" * 50)
-    print("Ingestion Complete.")
+    result = IngestResult(
+        church_id=church_id,
+        pages=len(documents),
+        chunks=len(chunks),
+        chroma_path=str(persist_dir),
+    )
+    logger.info(
+        "ingest_complete",
+        extra={"extra_fields": {"church_id": church_id, "pages": result.pages, "chunks": result.chunks}},
+    )
+    return result
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Ingest church JSONL into Chroma")
+    parser.add_argument("--church_id", type=str, default=config.DEFAULT_CHURCH_ID)
+    parser.add_argument("--input_file", type=str, default="scraped_data.jsonl")
+    parser.add_argument("--reset", action="store_true")
+    args = parser.parse_args()
+
+    data_path = Path(args.input_file)
+    if not data_path.is_absolute():
+        if data_path.exists():
+            data_path = data_path.resolve()
+        else:
+            candidate = config.PROJECT_ROOT / args.input_file
+            data_path = candidate if candidate.exists() else data_path
+
+    try:
+        result = ingest_records(args.church_id, data_path, reset=args.reset)
+    except Exception as e:
+        print(f"[ERROR] {e}", file=sys.stderr)
+        sys.exit(1)
+
+    print(f"Ingested {result.pages} pages / {result.chunks} chunks for {result.church_id}")
+
 
 if __name__ == "__main__":
     main()

@@ -75,19 +75,21 @@ def validate_and_fix_links(text: str, valid_urls: Set[str], fallback_url: str, m
                      return f"[{label}]({v})"
 
         # 3. Smart Keyword Fallback (Generic)
-        # Check if the hallucinates URL path (e.g. "give") matches a known concept
+        # Match hallucinated path OR link label against known concepts.
         cleaned_path = url.strip("/").lower()
-        
-        # Check our predefined concepts
+        haystacks = [cleaned_path, label_lower]
+
         for concept, keywords in KEYWORD_FALLBACKS.items():
-            if concept in cleaned_path:
-                # Look for a VALID URL that matches any of these keywords
-                for v in valid_urls:
-                    v_lower = v.lower()
-                    if any(kw in v_lower for kw in keywords):
-                        # Found a match! e.g. "tithes-and-offerings" contains "tithe"
-                        return f"[{label}]({v})"
-                        
+            concept_hit = any(
+                concept in h or any(kw in h for kw in keywords) for h in haystacks
+            )
+            if not concept_hit:
+                continue
+            for v in valid_urls:
+                v_lower = v.lower()
+                if any(kw in v_lower for kw in keywords):
+                    return f"[{label}]({v})"
+
         # Fallback: STRICT GUARANTEE
         # If we reached here, the URL is NOT in our database and didn't match any heuristic.
         # We MUST replace it to prevent 404s/Hallucinations.

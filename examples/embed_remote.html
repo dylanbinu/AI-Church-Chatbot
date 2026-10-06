@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Local Test - Heritage Church Bot</title>
+    <style>
+        body {
+            font-family: sans-serif;
+            padding: 2rem;
+            background: #f0fdf4;
+        }
+
+        .explanation {
+            background: white;
+            padding: 20px;
+            border-radius: 8px;
+            max-width: 600px;
+            margin: 0 auto;
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+        }
+    </style>
+</head>
+
+<body>
+
+    <div class="explanation">
+        <h1>Simulating Heritage Church Website</h1>
+        <p>This file is running LOCALLY on your computer.</p>
+        <p>The Chatbot below is loaded from the CLOUD (AWS Lambda).</p>
+        <p>If this works, it proves the bot can be embedded on ANY website.</p>
+    </div>
+
+    <!--
+      Replace YOUR_LAMBDA_URL with your Function URL.
+      church-id must match an entry in code/churches.json / S3 bundle key.
+    -->
+    <script src="https://YOUR_LAMBDA_URL/church_chatbot.js" defer></script>
+    <church-chatbot
+        church-id="heritage"
+        api-url="https://YOUR_LAMBDA_URL/chat"
+        title="Heritage Assistant"
+        greeting="Hello! How can I help you today?"
+    ></church-chatbot>
+
+</body>
+
+</html>
