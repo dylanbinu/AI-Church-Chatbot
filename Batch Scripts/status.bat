@@ -3,7 +3,11 @@ setlocal
 if "%AWS_REGION%"=="" set AWS_REGION=us-east-1
 if "%CHAT_FUNCTION_NAME%"=="" set CHAT_FUNCTION_NAME=church-bot-heritage
 if "%UPDATER_FUNCTION_NAME%"=="" set UPDATER_FUNCTION_NAME=church-bot-updater
-if "%FUNCTION_URL%"=="" set FUNCTION_URL=https://2h5pmesij2pbwj5iey7gweodpm0pfnxb.lambda-url.us-east-1.on.aws
+if exist ".env" (
+  for /f "usebackq tokens=1,* delims==" %%a in (`findstr /b "FUNCTION_URL=" .env`) do (
+    if "%%a"=="FUNCTION_URL" if "%FUNCTION_URL%"=="" set "FUNCTION_URL=%%b"
+  )
+)
 
 echo ==================================================
 echo   CHURCH BOT STATUS
@@ -20,8 +24,12 @@ if errorlevel 1 echo (updater not found yet)
 
 echo.
 echo [Health]
-curl -s "%FUNCTION_URL%/health?church_id=heritage"
-echo.
+if "%FUNCTION_URL%"=="" (
+  echo Set FUNCTION_URL in .env to check the chat address. Do not commit that file.
+) else (
+  curl -s "%FUNCTION_URL%/health?church_id=heritage"
+  echo.
+)
 echo.
 pause
 endlocal
